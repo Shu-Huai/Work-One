@@ -20,7 +20,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from utils import set_all_seeds
+from utils import set_all_seeds, cosine_with_warmup_lr, extend_clip_context_length, freeze_to_projection_only
+from metrics.retrieval_metrics import retrieval_metrics_multi
 import clip
 
 from dataset import CaptioningDataset, captioning_collate_fn
@@ -61,81 +62,13 @@ SAVE_NAME = CLIP_MODEL_NAME.replace("/","").replace("-","")
 SAVE_PATH = f"./ckpt/single_image_clip_{SAVE_NAME}.pt"
 
 # 测试评测分块
+TEXT_CHUNK = 32
 CHUNK_SIZE = 512
 # ============================================================
-
-
-
-
-def extend_clip_context_length(model, new_len: int):
-    """
-    把 openai/CLIP 的 context length 从 77 扩到 new_len（如 256）
-    同时更新：
-      - positional_embedding
-      - model.attn_mask / buffer
-      - 每个 transformer block 的 block.attn_mask  （否则还是 77x77，会报你这个错）
-    """
-    import torch
-    import torch.nn.functional as F
-
-    if new_len == model.context_length:
-        return
-
-    old_len = model.context_length
-    if new_len < old_len:
-        raise ValueError(f"new_len({new_len}) must be >= old_len({old_len})")
-
-    device = model.positional_embedding.device
-    dtype = model.positional_embedding.dtype
-
-    # 1) 扩 positional embedding
-    with torch.no_grad():
-        old_pe = model.positional_embedding.detach()          # [old_len, width]
-        pe = old_pe.T.unsqueeze(0)                            # [1, width, old_len]
-        pe_new = F.interpolate(pe, size=new_len, mode="linear", align_corners=False)
-        pe_new = pe_new.squeeze(0).T.contiguous()             # [new_len, width]
-
-    model.context_length = new_len
-    model.positional_embedding = torch.nn.Parameter(pe_new.to(device=device, dtype=dtype))
-
-    # 2) 生成并替换 attn_mask（model 级）
-    attn_mask = model.build_attention_mask().to(device=device)
-    model.attn_mask = attn_mask
-    model._buffers["attn_mask"] = attn_mask
-
-    # 3) 关键：替换每个 block 缓存的 attn_mask
-    for blk in model.transformer.resblocks:
-        blk.attn_mask = attn_mask
-
-
-def freeze_to_projection_only(model):
-    """
-    贴论文：只 finetune CLIP projection layers（+ logit_scale）
-    """
-    for p in model.parameters():
-        p.requires_grad = False
-
-    if getattr(model, "text_projection", None) is not None:
-        model.text_projection.requires_grad = True
-    if getattr(model, "logit_scale", None) is not None:
-        model.logit_scale.requires_grad = True
-    if hasattr(model, "visual") and getattr(model.visual, "proj", None) is not None:
-        model.visual.proj.requires_grad = True
-
 
 def build_optimizer(model):
     params = [p for p in model.parameters() if p.requires_grad]
     return torch.optim.Adam(params, lr=LR, weight_decay=WEIGHT_DECAY)
-
-
-def cosine_with_warmup_lr(step: int, total_steps: int, warmup_steps: int) -> float:
-    if total_steps <= 0:
-        return 1.0
-    warmup_steps = min(warmup_steps, total_steps)
-    if warmup_steps > 0 and step < warmup_steps:
-        return (step + 1) / warmup_steps
-    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 @torch.no_grad()
@@ -192,43 +125,6 @@ def compute_embeddings_for_eval(
         all_imgset.append(imgset_feats.cpu())
 
     return torch.cat(all_text, dim=0), torch.cat(all_imgset, dim=0)
-
-
-@torch.no_grad()
-def retrieval_metrics(
-    text_feats: torch.Tensor,
-    imgset_feats: torch.Tensor,
-    device: torch.device,
-    chunk_size: int = 512,
-) -> Dict[str, float]:
-    """
-    GT：第 i 个 text 对应第 i 个 image-set（所以 test_loader 必须 shuffle=False）
-    """
-    N, _ = text_feats.shape
-    text_feats = text_feats.to(device)
-    imgset_feats = imgset_feats.to(device)
-    imgset_T = imgset_feats.t()
-
-    ranks = torch.empty(N, dtype=torch.long, device="cpu")
-
-    for start in tqdm(range(0, N, chunk_size), desc="Test Scoring"):
-        end = min(start + chunk_size, N)
-        scores = text_feats[start:end] @ imgset_T  # [C,N]
-
-        gt_idx = torch.arange(start, end, device=device)
-        row_idx = torch.arange(0, end - start, device=device)
-        gt_scores = scores[row_idx, gt_idx]
-
-        r = (scores > gt_scores.unsqueeze(1)).sum(dim=1) + 1
-        ranks[start:end] = r.cpu()
-
-    return {
-        "N": float(N),
-        "R@1": float((ranks <= 1).float().mean().item()),
-        "R@5": float((ranks <= 5).float().mean().item()),
-        "R@10": float((ranks <= 10).float().mean().item()),
-        "MedianRank": float(ranks.median().item()),
-    }
 
 
 def main():
@@ -369,8 +265,14 @@ def main():
         use_fp16=USE_FP16,
         require_num_images=REQUIRE_NUM_IMAGES,
     )
-    metrics = retrieval_metrics(text_feats, imgset_feats, device=device, chunk_size=CHUNK_SIZE)
-
+    metrics = retrieval_metrics_multi(
+        text_embs_cpu=text_feats.detach().cpu(),
+        imgset_embs_cpu=imgset_feats.detach().cpu(),
+        logit_scale=model.logit_scale,      # 或 clip_model.logit_scale
+        device=device,
+        text_chunk=TEXT_CHUNK,              # 原来的 chunk_size 用这个
+        cand_chunk=CHUNK_SIZE,         # 你需要新增一个，常用 1024/2048/4096
+    )
     print(f"\n==== Test Results (Single Image) on {CLIP_MODEL_NAME} ====")
     print(f"N={int(metrics['N'])}")
     print(f"R@1={metrics['R@1']:.4f}  R@5={metrics['R@5']:.4f}  R@10={metrics['R@10']:.4f}")

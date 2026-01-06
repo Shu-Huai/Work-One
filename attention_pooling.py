@@ -24,7 +24,9 @@ import os
 import math
 import random
 from typing import List, Dict, Tuple
-from utils import set_seed
+from utils import set_seed, cosine_with_warmup_lr, extend_clip_context_length, cast_trainable_params_to_fp32
+from utils import clip_encode_text_safe, clip_encode_image_safe, freeze_to_projection_only
+from metrics.retrieval_metrics import retrieval_metrics_multi
 
 import torch
 import torch.nn as nn
@@ -44,16 +46,7 @@ TEST_JSON_PATH  = "data/captioning_dataset_5imgs_test_40.json"
 IMAGE_ROOT = "data/resized"
 
 # 你要跑的模型列表
-CLIP_MODEL_LIST = [
-    "ViT-L/14",
-    "ViT-B/16",
-    "ViT-B/32",
-    "RN50x64",
-    "RN50x16",
-    "RN50x4",
-    "RN101",
-    "RN50",
-]
+CLIP_MODEL_NAME = "ViT-L/14@336px"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 USE_FP16 = True
@@ -93,137 +86,12 @@ REQUIRE_NUM_IMAGES = 5
 CKPT_DIR = "./ckpt"
 # ============================================================
 
-
-# --------------------- utils ---------------------
-
-
-def cosine_with_warmup_lr(step: int, total_steps: int, warmup_steps: int) -> float:
-    if total_steps <= 0:
-        return 1.0
-    warmup_steps = min(warmup_steps, total_steps)
-    if warmup_steps > 0 and step < warmup_steps:
-        return (step + 1) / warmup_steps
-    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-
-def extend_clip_context_length(model, new_len: int):
-    """
-    77 -> 256：插值 positional_embedding + 重建 attn_mask，并同步到每个 block
-    """
-    import torch.nn.functional as F
-
-    if new_len == model.context_length:
-        return
-    old_len = model.context_length
-    if new_len < old_len:
-        raise ValueError(f"new_len({new_len}) must be >= old_len({old_len})")
-
-    device = model.positional_embedding.device
-    dtype = model.positional_embedding.dtype
-
-    with torch.no_grad():
-        old_pe = model.positional_embedding.detach()  # [old_len, width]
-        pe = old_pe.T.unsqueeze(0)                    # [1, width, old_len]
-        pe_new = F.interpolate(pe, size=new_len, mode="linear", align_corners=False)
-        pe_new = pe_new.squeeze(0).T.contiguous()     # [new_len, width]
-
-    model.context_length = new_len
-    model.positional_embedding = torch.nn.Parameter(pe_new.to(device=device, dtype=dtype))
-
-    attn_mask = model.build_attention_mask().to(device=device)
-    model.attn_mask = attn_mask
-    model._buffers["attn_mask"] = attn_mask
-    for blk in model.transformer.resblocks:
-        blk.attn_mask = attn_mask
-
-
-def freeze_to_projection_only(model):
-    """
-    贴论文：只 finetune projection layers（+ logit_scale）
-    注意：对 RN 系列，openai/CLIP 里通常没有 visual.proj；因此这里保持“最小修改”——仍只训 text_projection/logit_scale。
-    """
-    for p in model.parameters():
-        p.requires_grad = False
-
-    if getattr(model, "text_projection", None) is not None:
-        model.text_projection.requires_grad = True
-    if getattr(model, "logit_scale", None) is not None:
-        model.logit_scale.requires_grad = True
-    if hasattr(model, "visual") and getattr(model.visual, "proj", None) is not None:
-        model.visual.proj.requires_grad = True
-
-
-def cast_trainable_params_to_fp32(model):
-    """
-    避免 GradScaler 在 fp16 参数上 unscale 报错：把 requires_grad 的参数转 fp32
-    """
-    for p in model.parameters():
-        if p.requires_grad:
-            p.data = p.data.float()
-
-
 def _sanitize_model_name(name: str) -> str:
     return (
         name.replace("/", "_")
             .replace("-", "_")
     )
 
-
-# --------------------- CLIP safe encoders (dtype align) ---------------------
-def clip_encode_text_safe(clip_model, tokens: torch.Tensor) -> torch.Tensor:
-    """
-    等价于 clip_model.encode_text，但在 x @ text_projection 前对齐 dtype
-    """
-    x = clip_model.token_embedding(tokens).type(clip_model.dtype)
-    x = x + clip_model.positional_embedding.type(clip_model.dtype)
-    x = x.permute(1, 0, 2)
-    x = clip_model.transformer(x)
-    x = x.permute(1, 0, 2)
-    x = clip_model.ln_final(x).type(clip_model.dtype)
-
-    eot = tokens.argmax(dim=-1)
-    x = x[torch.arange(x.shape[0], device=x.device), eot]  # [B, width]
-
-    proj = clip_model.text_projection
-    if proj is not None and proj.dtype != x.dtype:
-        proj = proj.to(x.dtype)
-    x = x @ proj
-    return x
-
-
-def clip_encode_image_safe(clip_model, images: torch.Tensor) -> torch.Tensor:
-    """
-    ViT 视觉塔：在 x @ visual.proj 前对齐 dtype
-    RN 系列：走 clip_model.encode_image（保持最小改动）
-    """
-    visual = clip_model.visual
-    if visual.__class__.__name__ == "VisionTransformer":
-        x = images.type(visual.conv1.weight.dtype)
-        x = visual.conv1(x)
-        x = x.reshape(x.shape[0], x.shape[1], -1)
-        x = x.permute(0, 2, 1)
-
-        cls = visual.class_embedding.to(x.dtype)
-        cls = cls + torch.zeros(x.shape[0], 1, x.shape[-1], device=x.device, dtype=x.dtype)
-        x = torch.cat([cls, x], dim=1)
-        x = x + visual.positional_embedding.to(x.dtype)
-        x = visual.ln_pre(x)
-
-        x = x.permute(1, 0, 2)
-        x = visual.transformer(x)
-        x = x.permute(1, 0, 2)
-
-        x = visual.ln_post(x[:, 0, :])
-
-        proj = visual.proj
-        if proj is not None and proj.dtype != x.dtype:
-            proj = proj.to(x.dtype)
-        if proj is not None:
-            x = x @ proj
-        return x
-
-    return clip_model.encode_image(images)
 
 
 # --------------------- ImageSet pooling ---------------------
@@ -330,66 +198,19 @@ def build_embeddings(
 
     return torch.cat(all_t, dim=0), torch.cat(all_i, dim=0)
 
-
-@torch.no_grad()
-def retrieval_metrics(
-    text_embs_cpu: torch.Tensor,    # [N,D]
-    imgset_embs_cpu: torch.Tensor,  # [N,D]
-    logit_scale: torch.Tensor,
-    device: torch.device,
-    text_chunk: int,
-    cand_chunk: int,
-) -> Dict[str, float]:
-    """
-    text->imgset 检索，GT 为同 index
-    """
-    N, D = text_embs_cpu.shape
-    ranks = torch.empty(N, dtype=torch.long)
-    scale = logit_scale.exp().detach().float().to(device)
-
-    img_all = imgset_embs_cpu.to(device)  # [N,D]
-
-    for t0 in tqdm(range(0, N, text_chunk), desc="Scoring (texts)"):
-        t1 = min(t0 + text_chunk, N)
-        t = text_embs_cpu[t0:t1].to(device)  # [C,D]
-        C = t.shape[0]
-
-        scores = torch.empty((C, N), dtype=torch.float32)  # CPU
-
-        for c0 in range(0, N, cand_chunk):
-            c1 = min(c0 + cand_chunk, N)
-            cand = img_all[c0:c1]  # [M,D]
-            sim = (t @ cand.t()) * scale
-            scores[:, c0:c1] = sim.detach().cpu()
-
-        gt_idx = torch.arange(t0, t1)
-        row = torch.arange(0, C)
-        gt_score = scores[row, gt_idx]
-        rank = (scores > gt_score.unsqueeze(1)).sum(dim=1) + 1
-        ranks[t0:t1] = rank
-
-    return {
-        "N": float(N),
-        "R@1": float((ranks <= 1).float().mean().item()),
-        "R@5": float((ranks <= 5).float().mean().item()),
-        "R@10": float((ranks <= 10).float().mean().item()),
-        "MedianRank": float(ranks.median().item()),
-    }
-
-
-def train_one_model(model_name: str):
+def main():
     set_seed(SEED)
     device = torch.device(DEVICE)
 
-    save_name = _sanitize_model_name(model_name)
+    save_name = _sanitize_model_name(CLIP_MODEL_NAME)
     save_path = os.path.join(CKPT_DIR, f"attention_pooling_{save_name}.pt")
 
     print("\n" + "=" * 90)
-    print(f"[RUN] CLIP_MODEL_NAME = {model_name}")
+    print(f"[RUN] CLIP_MODEL_NAME = {CLIP_MODEL_NAME}")
     print("=" * 90)
 
     # 1) load CLIP
-    clip_model, preprocess = clip.load(model_name, device=device, jit=False)
+    clip_model, preprocess = clip.load(CLIP_MODEL_NAME, device=device, jit=False)
 
     # 2) extend ctx
     if TEXT_CONTEXT_LENGTH != clip_model.context_length:
@@ -455,7 +276,7 @@ def train_one_model(model_name: str):
         clip_model.train()
         set_tx.train()
 
-        pbar = tqdm(train_loader, desc=f"[{model_name}] Train epoch {epoch}/{EPOCHS}")
+        pbar = tqdm(train_loader, desc=f"[Train epoch {epoch}/{EPOCHS}")
         for batch in pbar:
             articles: List[str] = batch["articles"]
             imgs_list: List[torch.Tensor] = batch["images"]  # list of [5,3,H,W]
@@ -523,7 +344,7 @@ def train_one_model(model_name: str):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(
         {
-            "clip_model_name": model_name,
+            "clip_model_name": CLIP_MODEL_NAME,
             "context_length": int(clip_model.context_length),
             "embed_dim": int(embed_dim),
             "clip_state": clip_model.state_dict(),
@@ -538,7 +359,7 @@ def train_one_model(model_name: str):
     set_tx.eval()
     with torch.no_grad():
         text_embs, imgset_embs = build_embeddings(test_loader, clip_model, set_tx, device, USE_FP16)
-        metrics = retrieval_metrics(
+        metrics = retrieval_metrics_multi(
             text_embs, imgset_embs,
             logit_scale=clip_model.logit_scale,
             device=device,
@@ -546,7 +367,7 @@ def train_one_model(model_name: str):
             cand_chunk=CAND_CHUNK,
         )
     print(
-        f"\n[{model_name}] Retrieval:\n"
+        f"\n[{CLIP_MODEL_NAME}] Retrieval:\n"
         f"N={int(metrics['N'])}\n"
         f"R@1={metrics['R@1']:.4f}  R@5={metrics['R@5']:.4f}  R@10={metrics['R@10']:.4f}\n"
         f"MedianRank={metrics['MedianRank']:.1f}\n"
@@ -556,11 +377,6 @@ def train_one_model(model_name: str):
     del clip_model, set_tx, optimizer, train_loader, test_loader, train_ds, test_ds, text_embs, imgset_embs
     if device.type == "cuda":
         torch.cuda.empty_cache()
-
-
-def main():
-    for name in CLIP_MODEL_LIST:
-        train_one_model(name)
 
 
 if __name__ == "__main__":

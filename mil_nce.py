@@ -18,8 +18,8 @@ MIL-NCE baseline (论文里的 MIL-NCE / Multi-Instance InfoNCE)
 import math
 import random
 from typing import List, Tuple, Dict, Any
-from utils import set_seed
-
+from utils import set_seed, cosine_with_warmup_lr, extend_clip_context_length, cast_trainable_params_to_fp32, freeze_to_projection_only
+from metrics.retrieval_metrics import retrieval_metrics_multi
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -62,85 +62,10 @@ CLIP_MODEL_NAME = "ViT-L/14@336px"
 SAVE_NAME = CLIP_MODEL_NAME.replace("/","").replace("-","")
 SAVE_PATH = f"./ckpt/mil_nce_clip_{SAVE_NAME}.pt"
 # 测试评测分块
-CHUNK_SIZE = 512
+TEXT_CHUNK = 32
+CAND_CHUNK = 512
 REQUIRE_NUM_IMAGES = 5
 # ============================================================
-
-
-
-
-
-def cosine_with_warmup_lr(step: int, total_steps: int, warmup_steps: int) -> float:
-    if total_steps <= 0:
-        return 1.0
-    warmup_steps = min(warmup_steps, total_steps)
-    if warmup_steps > 0 and step < warmup_steps:
-        return (step + 1) / warmup_steps
-    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-
-def extend_clip_context_length(model, new_len: int):
-    """
-    安全扩展 openai/CLIP 的 context length（77 -> 256）：
-    - positional_embedding 线性插值
-    - model.attn_mask / buffer
-    - 每个 transformer block 的 attn_mask（否则仍是 77x77 会报错）
-    """
-    import torch.nn.functional as F
-
-    if new_len == model.context_length:
-        return
-    old_len = model.context_length
-    if new_len < old_len:
-        raise ValueError(f"new_len({new_len}) must be >= old_len({old_len})")
-
-    device = model.positional_embedding.device
-    dtype = model.positional_embedding.dtype
-
-    with torch.no_grad():
-        old_pe = model.positional_embedding.detach()          # [old_len, width]
-        pe = old_pe.T.unsqueeze(0)                            # [1, width, old_len]
-        pe_new = F.interpolate(pe, size=new_len, mode="linear", align_corners=False)
-        pe_new = pe_new.squeeze(0).T.contiguous()             # [new_len, width]
-
-    model.context_length = new_len
-    model.positional_embedding = torch.nn.Parameter(pe_new.to(device=device, dtype=dtype))
-
-    attn_mask = model.build_attention_mask().to(device=device)
-    model.attn_mask = attn_mask
-    model._buffers["attn_mask"] = attn_mask
-
-    for blk in model.transformer.resblocks:
-        blk.attn_mask = attn_mask
-
-
-def freeze_to_projection_only(model):
-    """
-    贴论文：只 finetune projection layers（+ logit_scale）
-    """
-    for p in model.parameters():
-        p.requires_grad = False
-
-    if getattr(model, "text_projection", None) is not None:
-        model.text_projection.requires_grad = True
-    if getattr(model, "logit_scale", None) is not None:
-        model.logit_scale.requires_grad = True
-    if hasattr(model, "visual") and getattr(model.visual, "proj", None) is not None:
-        model.visual.proj.requires_grad = True
-
-
-def cast_trainable_params_to_fp32(model):
-    """
-    关键：openai/CLIP 在 CUDA 上很多参数是 fp16，GradScaler 会报
-      "Attempting to unscale FP16 gradients."
-    所以把 requires_grad=True 的参数转成 fp32。
-    """
-    for p in model.parameters():
-        if p.requires_grad:
-            p.data = p.data.float()
-
-
 def build_optimizer(model):
     params = [p for p in model.parameters() if p.requires_grad]
     return torch.optim.Adam(params, lr=LR, weight_decay=WEIGHT_DECAY)
@@ -400,7 +325,14 @@ def main():
         use_fp16=USE_FP16,
         require_num_images=REQUIRE_NUM_IMAGES,
     )
-    metrics = retrieval_metrics(text_feats, bag_feats, device=device, chunk_size=CHUNK_SIZE)
+    metrics = retrieval_metrics_multi(
+        text_embs_cpu=text_feats.detach().cpu(),
+        imgset_embs_cpu=bag_feats.detach().cpu(),
+        logit_scale=model.logit_scale,    
+        device=device,
+        text_chunk=TEXT_CHUNK,         
+        cand_chunk=CAND_CHUNK,      
+    )
 
     print(f"\n==== Test Results (MIL-NCE trained, mean(sim) eval) using CLIP {CLIP_MODEL_NAME} ====")
     print(f"N={int(metrics['N'])}")
