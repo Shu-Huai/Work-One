@@ -1,0 +1,7 @@
+CLIP=ViT-L/14@336px
+CTX=256, BATCH=64, EPOCHS=20, LR=5e-05
+POOL=attn, POLICY=all
+
+Dropout=0.1	L=1	H=2
+Max R@1=0.4967  Max R@5=0.7063  Max R@10=0.7837  Best MedianRank=2.0
+

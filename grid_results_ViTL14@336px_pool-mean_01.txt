@@ -1,0 +1,28 @@
+CLIP=ViT-L/14@336px
+CTX=256, BATCH=64, EPOCHS=20, LR=5e-05
+POOL=mean, POLICY=all
+
+Dropout=0.1	L=4	H=8
+Max R@1=0.4003  Max R@5=0.6345  Max R@10=0.7091  Best MedianRank=2.0
+
+Dropout=0.1	L=2	H=4
+Max R@1=0.4639  Max R@5=0.6901  Max R@10=0.7643  Best MedianRank=2.0
+
+Dropout=0.1	L=4	H=4
+Max R@1=0.4038  Max R@5=0.6426  Max R@10=0.7193  Best MedianRank=2.0
+
+Dropout=0.1	L=1	H=4
+Max R@1=0.4854  Max R@5=0.7126  Max R@10=0.7826  Best MedianRank=2.0
+
+Dropout=0.1	L=2	H=8
+Max R@1=0.4573  Max R@5=0.6884  Max R@10=0.7650  Best MedianRank=2.0
+
+Dropout=0.1	L=1	H=8
+Max R@1=0.4858  Max R@5=0.7137  Max R@10=0.7837  Best MedianRank=2.0
+
+Dropout=0.1	L=4	H=2
+Max R@1=0.4101  Max R@5=0.6447  Max R@10=0.7232  Best MedianRank=2.0
+
+Dropout=0.1	L=4	H=12
+Max R@1=0.3978  Max R@5=0.6356  Max R@10=0.7151  Best MedianRank=2.0
+
