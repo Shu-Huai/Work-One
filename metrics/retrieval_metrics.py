@@ -1,4 +1,4 @@
-import tqdm
+from tqdm import tqdm
 import torch
 from typing import Dict
 @torch.no_grad()
